@@ -826,7 +826,11 @@ type PaperclipWakePayload = {
 };
 
 // Match markdown image links while allowing balanced parentheses in URLs.
-const MARKDOWN_IMAGE_LINK_RE = /!\[[^\]]*?\]\(((?:[^()]+|\([^()]*\))*)\)/g;
+// Unrolled-loop form: [^()]* then (\( ... \) [^()]*)* — each iteration must
+// start with a literal "(", so the engine never has two ways to consume the
+// same character. The naive (?:[^()]+|\([^()]*\))* form backtracks
+// exponentially on an unclosed link (ReDoS on untrusted comment bodies).
+const MARKDOWN_IMAGE_LINK_RE = /!\[[^\]]*?\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g;
 
 function normalizePaperclipWakeRecovery(
   value: unknown,
