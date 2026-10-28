@@ -60,14 +60,12 @@ function createDbStub(selectResults: ApprovalRecord[][], updateResults: Approval
   const set = vi.fn(() => ({ where: updateWhere }));
   const update = vi.fn(() => ({ set }));
 
-  return {
-    db: { select, update, transaction: vi.fn(async (callback: (db: unknown) => Promise<unknown>) => {
-      inTransaction = true;
-      try { return await callback({ select, update }); } finally { inTransaction = false; }
-    }) },
-    selectWhere,
-    returning,
-  };
+  const db = { select, update, transaction: vi.fn(async (callback: (db: unknown) => Promise<unknown>) => {
+    const outerTransaction = inTransaction;
+    inTransaction = true;
+    try { return await callback(db); } finally { inTransaction = outerTransaction; }
+  }) };
+  return { db, selectWhere, returning };
 }
 
 describe("approvalService resolution idempotency", () => {
@@ -141,6 +139,7 @@ describe("approvalService resolution idempotency", () => {
       requestedByUserId,
       payload: {
         name: "New Agent",
+        adapterType: "codex_local",
         adapterConfig: {
           env: {
             API_KEY: {
@@ -161,9 +160,10 @@ describe("approvalService resolution idempotency", () => {
     expect(mockAgentService.create).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({
+        adapterType: "codex_local",
         adapterConfig: approved.payload.adapterConfig,
       }),
-      { createdByUserId: expectedCreator, responsibleUserId: requestedByUserId },
+      { runnerResolved: true, createdByUserId: expectedCreator, responsibleUserId: requestedByUserId },
     );
   });
 });

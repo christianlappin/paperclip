@@ -360,7 +360,6 @@ export function NewIssueDialog() {
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
     enabled: newIssueOpen,
-    retry: false,
   });
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
   const activeProjects = useMemo(() => projects ?? [], [projects]);
@@ -389,14 +388,12 @@ export function NewIssueDialog() {
       reuseEligible: true,
     }),
     enabled: Boolean(effectiveCompanyId) && newIssueOpen && canChooseWorktrees,
-    retry: false,
   });
 
   const { data: privacyParent, isError: parentPrivacyError, refetch: refetchParentPrivacy } = useQuery({
     queryKey: queryKeys.issues.detail(newIssueDefaults.parentId ?? ""),
     queryFn: () => issuesApi.get(newIssueDefaults.parentId!),
     enabled: newIssueOpen && Boolean(newIssueDefaults.parentId),
-    retry: false,
   });
   const parentPrivacyUnresolved = isSubIssueMode && !privacyParent;
   const inheritsPrivateAccess = privacyParent?.visibility === "private" || privacyParent?.project?.visibility === "private";
@@ -816,9 +813,11 @@ export function NewIssueDialog() {
     const executionWorkspaceSettings = executionWorkspacePolicy?.enabled
       ? { mode: requestedExecutionWorkspaceMode }
       : null;
-    const requestedProjectWorkspaceId = canChooseWorktrees && executionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace
-      ? selectedReusableExecutionWorkspace.projectWorkspaceId
-      : projectWorkspaceId;
+    const requestedProjectWorkspaceId = !workspaceIsolationControlsVisible
+      ? (newIssueDefaults.projectId === projectId ? newIssueDefaults.projectWorkspaceId : undefined)
+      : canChooseWorktrees && executionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace
+        ? selectedReusableExecutionWorkspace.projectWorkspaceId
+        : projectWorkspaceId;
     // A task launched from a workspace (or its parent task) keeps that explicit
     // context. Draft-only choices are ignored while the selector is hidden.
     const contextualWorkspaceId =
