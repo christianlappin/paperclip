@@ -102,7 +102,11 @@ import {
 } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { publishLiveEvent } from "../live-events.js";
-import { detectRunLoop, LOOP_DETECTOR_WINDOW_SEC } from "../run-loop-detector.js";
+import {
+  detectRunLoops,
+  LOOP_DETECTOR_RUN_FETCH_LIMIT,
+  LOOP_DETECTOR_WINDOW_SEC,
+} from "../run-loop-detector.js";
 import { allocateHeartbeatRunEventSeq } from "../heartbeat-run-events.js";
 import {
   queuedCommentIdsFromWakePayload,
@@ -1996,46 +2000,54 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.agentId, agent.id), gt(heartbeatRuns.createdAt, windowStart)))
         .orderBy(desc(heartbeatRuns.createdAt))
-        .limit(50);
+        .limit(LOOP_DETECTOR_RUN_FETCH_LIMIT);
 
-      const signal = detectRunLoop({
+      const signals = detectRunLoops({
         agentId: agent.id,
         recentRuns,
         now: new Date(),
       });
-      if (!signal) return;
+      if (signals.length === 0) return;
 
-      const key = runLoopSignalKey(signal.agentId, signal.issueId, signal.wakeReason);
       const nowMs = Date.now();
-      const lastEmittedAt = lastRunLoopSignalEmittedAtMs.get(key);
-      if (lastEmittedAt !== undefined && nowMs - lastEmittedAt < signal.windowSec * 1000) {
-        return;
-      }
       // Opportunistic pruning to keep the cooldown map bounded under long
-      // uptimes — drop entries older than 2x the window.
-      const pruneOlderThan = nowMs - 2 * signal.windowSec * 1000;
+      // uptimes — drop entries older than 2x the window. All signals share the
+      // same windowSec, so the worst (first) is representative.
+      const pruneOlderThan = nowMs - 2 * signals[0].windowSec * 1000;
       for (const [k, t] of lastRunLoopSignalEmittedAtMs) {
         if (t < pruneOlderThan) lastRunLoopSignalEmittedAtMs.delete(k);
       }
-      lastRunLoopSignalEmittedAtMs.set(key, nowMs);
 
-      logger.warn(
-        {
-          agentId: signal.agentId,
-          issueId: signal.issueId,
-          wakeReason: signal.wakeReason,
-          count: signal.count,
-          threshold: signal.threshold,
-          windowSec: signal.windowSec,
-          recentRunIds: signal.recentRunIds,
-        },
-        "agent run loop suspected",
-      );
-      publishLiveEvent({
-        companyId: agent.companyId,
-        type: "heartbeat.run_loop_suspected",
-        payload: signal as unknown as Record<string, unknown>,
-      });
+      // Emit every qualifying loop that is not on cooldown. Applying cooldown
+      // per group (rather than bailing out on the single worst group) means a
+      // second issue's active loop is still reported when the largest group is
+      // in its cooldown window.
+      for (const signal of signals) {
+        const key = runLoopSignalKey(signal.agentId, signal.issueId, signal.wakeReason);
+        const lastEmittedAt = lastRunLoopSignalEmittedAtMs.get(key);
+        if (lastEmittedAt !== undefined && nowMs - lastEmittedAt < signal.windowSec * 1000) {
+          continue;
+        }
+        lastRunLoopSignalEmittedAtMs.set(key, nowMs);
+
+        logger.warn(
+          {
+            agentId: signal.agentId,
+            issueId: signal.issueId,
+            wakeReason: signal.wakeReason,
+            count: signal.count,
+            threshold: signal.threshold,
+            windowSec: signal.windowSec,
+            recentRunIds: signal.recentRunIds,
+          },
+          "agent run loop suspected",
+        );
+        publishLiveEvent({
+          companyId: agent.companyId,
+          type: "heartbeat.run_loop_suspected",
+          payload: signal as unknown as Record<string, unknown>,
+        });
+      }
     } catch (err) {
       logger.error({ err, agentId: agent.id }, "run-loop detector failed");
     }

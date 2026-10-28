@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectRunLoop,
+  detectRunLoops,
+  LOOP_DETECTOR_RUN_FETCH_LIMIT,
+  LOOP_DETECTOR_THRESHOLD,
   type DetectRunLoopRecentRun,
 } from "../services/run-loop-detector.js";
 
@@ -191,5 +194,76 @@ describe("detectRunLoop", () => {
     expect(signal?.count).toBe(3);
     expect(signal?.threshold).toBe(3);
     expect(signal?.windowSec).toBe(600);
+  });
+});
+
+describe("detectRunLoops", () => {
+  const NOW = new Date("2026-05-11T13:00:00.000Z");
+  const wake = "issue_commented";
+
+  it("returns an empty array when nothing qualifies", () => {
+    expect(detectRunLoops({ agentId: "a", recentRuns: [], now: NOW })).toEqual([]);
+  });
+
+  it("returns every qualifying group, not only the worst, sorted worst-first", () => {
+    // Regression: the queue previously received only the single worst group, so
+    // if that group was on cooldown a distinct loop on another issue was hidden.
+    const big = [0, 1, 2, 3, 4, 5, 6].map((m, i) =>
+      run(`big-${i}`, m, { issueId: "issue-big", wakeReason: wake }, NOW),
+    );
+    const small = [0, 1, 2, 3, 4].map((m, i) =>
+      run(`small-${i}`, m, { issueId: "issue-small", wakeReason: wake }, NOW),
+    );
+    const belowThreshold = [0, 1, 2].map((m, i) =>
+      run(`tiny-${i}`, m, { issueId: "issue-tiny", wakeReason: wake }, NOW),
+    );
+    const signals = detectRunLoops({
+      agentId: "a",
+      recentRuns: [...small, ...big, ...belowThreshold],
+      now: NOW,
+      threshold: 5,
+      windowSec: 1800,
+    });
+    expect(signals.map((s) => s.issueId)).toEqual(["issue-big", "issue-small"]);
+    expect(signals.map((s) => s.count)).toEqual([7, 5]);
+  });
+
+  it("breaks count ties by earliest firstAt (longest-running loop first)", () => {
+    const older = [20, 15, 10, 5, 0].map((m, i) =>
+      run(`older-${i}`, m, { issueId: "issue-older", wakeReason: wake }, NOW),
+    );
+    const newer = [8, 6, 4, 2, 0].map((m, i) =>
+      run(`newer-${i}`, m, { issueId: "issue-newer", wakeReason: wake }, NOW),
+    );
+    const signals = detectRunLoops({
+      agentId: "a",
+      recentRuns: [...newer, ...older],
+      now: NOW,
+      threshold: 5,
+      windowSec: 1800,
+    });
+    expect(signals.map((s) => s.issueId)).toEqual(["issue-older", "issue-newer"]);
+  });
+
+  it("detectRunLoop returns the first element of detectRunLoops", () => {
+    const runs = [
+      ...[0, 1, 2, 3, 4, 5].map((m, i) =>
+        run(`a-${i}`, m, { issueId: "issue-a", wakeReason: wake }, NOW),
+      ),
+      ...[0, 1, 2, 3, 4].map((m, i) =>
+        run(`b-${i}`, m, { issueId: "issue-b", wakeReason: wake }, NOW),
+      ),
+    ];
+    const input = { agentId: "a", recentRuns: runs, now: NOW, threshold: 5, windowSec: 1800 };
+    expect(detectRunLoop(input)).toEqual(detectRunLoops(input)[0]);
+  });
+});
+
+describe("LOOP_DETECTOR_RUN_FETCH_LIMIT", () => {
+  it("never drops below the threshold, so a high threshold cannot silently disable detection", () => {
+    // Regression: a flat fetch limit of 50 silently disabled detection whenever
+    // the threshold exceeded 50, because the query could never return enough rows.
+    expect(LOOP_DETECTOR_RUN_FETCH_LIMIT).toBeGreaterThanOrEqual(LOOP_DETECTOR_THRESHOLD);
+    expect(LOOP_DETECTOR_RUN_FETCH_LIMIT).toBe(Math.max(50, LOOP_DETECTOR_THRESHOLD));
   });
 });

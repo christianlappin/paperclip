@@ -20,6 +20,18 @@ export const LOOP_DETECTOR_WINDOW_SEC = clampPositiveInt(
   1800,
 );
 
+/**
+ * How many recent runs the queue should fetch to feed the detector.
+ *
+ * A loop can only be flagged if enough of its runs are actually fetched, so the
+ * limit must cover at least `threshold` runs. Historically this was a flat 50;
+ * a `PAPERCLIP_LOOP_DETECTOR_THRESHOLD` above 50 then silently disabled
+ * detection because the query could never return enough rows to reach the
+ * threshold. Taking the max keeps the 50-row floor (and its grouping headroom)
+ * for the common low thresholds while scaling up for higher ones.
+ */
+export const LOOP_DETECTOR_RUN_FETCH_LIMIT = Math.max(50, LOOP_DETECTOR_THRESHOLD);
+
 export interface DetectRunLoopRecentRun {
   id: string;
   contextSnapshot: Record<string, unknown> | null;
@@ -47,16 +59,21 @@ export interface RunLoopSignal {
 }
 
 /**
- * Pure function. Returns the first/worst loop signal found, or null.
+ * Pure function. Returns every (issueId, wakeReason) group that reached the
+ * threshold inside the window, sorted worst-first.
  *
  * "Worst" = highest run count; ties broken by earliest firstAt (longest-running
  * loop wins). A run with no issueId AND no wakeReason is ignored — those are
  * usually one-off bootstraps, not loops.
+ *
+ * Returning all qualifying groups (not just the single worst) lets the caller
+ * skip a group that is on cooldown without hiding a distinct, still-active loop
+ * on another issue.
  */
-export function detectRunLoop(input: DetectRunLoopInput): RunLoopSignal | null {
+export function detectRunLoops(input: DetectRunLoopInput): RunLoopSignal[] {
   const threshold = input.threshold ?? LOOP_DETECTOR_THRESHOLD;
   const windowSec = input.windowSec ?? LOOP_DETECTOR_WINDOW_SEC;
-  if (threshold <= 0 || windowSec <= 0) return null;
+  if (threshold <= 0 || windowSec <= 0) return [];
 
   const windowStartMs = input.now.getTime() - windowSec * 1000;
   const groups = new Map<string, {
@@ -81,13 +98,13 @@ export function detectRunLoop(input: DetectRunLoopInput): RunLoopSignal | null {
     }
   }
 
-  let worst: RunLoopSignal | null = null;
+  const signals: RunLoopSignal[] = [];
   for (const bucket of groups.values()) {
     if (bucket.runs.length < threshold) continue;
     const sorted = [...bucket.runs].sort(
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
-    const signal: RunLoopSignal = {
+    signals.push({
       agentId: input.agentId,
       issueId: bucket.issueId,
       wakeReason: bucket.wakeReason,
@@ -97,14 +114,23 @@ export function detectRunLoop(input: DetectRunLoopInput): RunLoopSignal | null {
       threshold,
       firstAt: sorted[0].createdAt.toISOString(),
       lastAt: sorted[sorted.length - 1].createdAt.toISOString(),
-    };
-    if (!worst || signal.count > worst.count) {
-      worst = signal;
-    } else if (signal.count === worst.count && signal.firstAt < worst.firstAt) {
-      worst = signal;
-    }
+    });
   }
-  return worst;
+  // Worst first: highest count, then earliest firstAt (ISO strings compare
+  // chronologically). firstAt is unique enough in practice; a stable tiebreak
+  // is not required.
+  signals.sort(
+    (a, b) => b.count - a.count || (a.firstAt < b.firstAt ? -1 : a.firstAt > b.firstAt ? 1 : 0),
+  );
+  return signals;
+}
+
+/**
+ * Pure function. Returns the single worst loop signal found, or null. Thin
+ * wrapper over {@link detectRunLoops} for callers that only surface one loop.
+ */
+export function detectRunLoop(input: DetectRunLoopInput): RunLoopSignal | null {
+  return detectRunLoops(input)[0] ?? null;
 }
 
 function readString(value: unknown): string | null {
