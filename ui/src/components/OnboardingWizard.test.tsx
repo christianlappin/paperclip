@@ -208,6 +208,11 @@ vi.mock("../api/approvals", () => ({ approvalsApi: mockApprovalsApi }));
 vi.mock("../api/secrets", () => ({ secretsApi: mockSecretsApi }));
 vi.mock("../api/issues", () => ({ issuesApi: mockIssuesApi }));
 vi.mock("../api/agentChats", () => ({ agentChatsApi: mockAgentChatsApi }));
+const mockCaptureProductEvent = vi.hoisted(() => vi.fn());
+vi.mock("../lib/analytics/product-analytics", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/analytics/product-analytics")>()),
+  captureProductAnalyticsEvent: mockCaptureProductEvent,
+}));
 vi.mock("../api/projects", () => ({ projectsApi: mockProjectsApi }));
 vi.mock("../api/environments", () => ({ environmentsApi: mockEnvironmentsApi }));
 vi.mock("../api/instanceSettings", () => ({ instanceSettingsApi: mockInstanceSettingsApi }));
@@ -366,6 +371,15 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
     mockEnvironmentsApi.probe.mockReset().mockResolvedValue({ ok: true, driver: "sandbox", summary: "Measured image", details: { platformQualificationRecorded: true, leaseId: "platform-lease" } });
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableManagedSandboxOnly: false });
     localHealth.get.mockResolvedValue({ deploymentMode: "authenticated" });
+    mockEnvironmentsApi.list.mockReset().mockResolvedValue([{
+      id: "env-sandbox-1", driver: "sandbox", status: "active",
+      config: { provider: "daytona" }, metadata: {},
+    }]);
+    mockEnvironmentsApi.capabilities.mockReset().mockResolvedValue(getEnvironmentCapabilities([], {
+      sandboxProviders: { daytona: { supportsLoginPty: true } },
+    }));
+    mockInstanceSettingsApi.get.mockReset().mockResolvedValue({ defaultEnvironmentId: "env-sandbox-1" });
+    mockAgentsApi.getAdapterAuthSignal.mockReset().mockResolvedValue({ status: "present" });
     managedApi.checkLocalLogin.mockReset().mockResolvedValue({
       status: "sign_in_required",
       authorizationUrl: "https://claude.ai/oauth/authorize?code=true",
@@ -1462,6 +1476,26 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
         expect(mockCompany.setSelectedCompanyId).toHaveBeenCalledWith("c1", { source: "route_sync" });
         expect(mockIssuesApi.create).not.toHaveBeenCalled();
         expect(mockProjectsApi.create).not.toHaveBeenCalled();
+      } finally { await act(async () => root.unmount()); }
+    });
+
+    it("keeps onboarding analytics on the new company when the old launch settles late", async () => {
+      let settleLaunch!: (value: { id: string }) => void;
+      mockAgentChatsApi.startOnboarding.mockImplementationOnce(() => new Promise((resolve) => { settleLaunch = resolve; }));
+      const { root, queryClient } = await openSavedReview("/SC/onboarding");
+      try {
+        await act(async () => [...document.querySelectorAll("button")].find(button => button.textContent?.trim() === "Get started")!.click());
+        mockRouterState.pathname = "/OTHER/onboarding";
+        await renderWizardView(root, queryClient);
+        for (let tick = 0; tick < 8; tick++) await flushReact();
+        await act(async () => settleLaunch({ id: "onboarding-chat" }));
+        for (let tick = 0; tick < 4; tick++) await flushReact();
+        expect(mockNavigate).not.toHaveBeenCalled();
+        mockCaptureProductEvent.mockClear();
+        mockRouterState.pathname = "/OTHER/dashboard";
+        await renderWizardView(root, queryClient);
+        for (let tick = 0; tick < 4; tick++) await flushReact();
+        expect(mockCaptureProductEvent).toHaveBeenCalledWith("onboarding_dismissed", { step: "create_agent" });
       } finally { await act(async () => root.unmount()); }
     });
 
@@ -2811,6 +2845,71 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       });
       for (let i = 0; i < 8; i++) await flushReact();
     }
+
+    it.each([
+      ["claude_local", /Claude/],
+      ["codex_local", /OpenAI/],
+    ] as const)("blocks Connect and keyboard submission when %s browser sign-in is unsupported", async (adapterType, source) => {
+      mockEnvironmentsApi.capabilities.mockResolvedValue(getEnvironmentCapabilities([], {
+        sandboxProviders: { daytona: { supportsLoginPty: false } },
+      }));
+      const { root } = await openStep4({ adapterType });
+      try {
+        await pickSource(source);
+        const connect = [...document.body.querySelectorAll("button")].find(button => button.textContent?.trim() === "Connect")!;
+        expect(document.body.textContent).toContain("This environment does not support browser sign-in.");
+        expect(connect.disabled).toBe(true);
+        await act(async () => connect.click());
+        for (const modifier of [{ metaKey: true }, { ctrlKey: true }]) {
+          await act(async () => document.querySelector('[data-testid="onboarding-wizard"]')!.dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Enter", bubbles: true, ...modifier }),
+          ));
+        }
+        for (let i = 0; i < 6; i++) await flushReact();
+        expect(mockAgentsApi.startClaudeSetupTokenLogin).not.toHaveBeenCalled();
+        expect(mockAgentsApi.startAdapterAuthLogin).not.toHaveBeenCalled();
+        expect(mockAgentsApi.testEnvironment).not.toHaveBeenCalled();
+        expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+      } finally { await act(async () => root.unmount()); }
+    });
+
+    it("can go back and connect with an API key when browser sign-in is unsupported", async () => {
+      mockEnvironmentsApi.capabilities.mockResolvedValue(getEnvironmentCapabilities([], {
+        sandboxProviders: { daytona: { supportsLoginPty: false } },
+      }));
+      const { root } = await openStep4();
+      try {
+        await pickSource(/Claude/);
+        const back = [...document.body.querySelectorAll("button")].find(button => button.textContent?.trim().startsWith("Back"))!;
+        await act(async () => back.click());
+        for (let i = 0; i < 10; i++) await flushReact();
+        const modeSwitch = document.body.querySelector('[aria-label="Use API key instead"]') as HTMLButtonElement;
+        await act(async () => modeSwitch.click());
+        await pickSource(/Claude/);
+        expect(document.body.textContent).not.toContain("This environment does not support browser sign-in.");
+        const field = document.body.querySelector('input[type="password"]') as HTMLInputElement;
+        await act(async () => setControlledValue(field, "test-api-key"));
+        await pressArcPrimary();
+        expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(1);
+        expect(mockAgentsApi.hire).toHaveBeenCalledTimes(1);
+      } finally { await act(async () => root.unmount()); }
+    });
+
+    it("can use a saved subscription when browser sign-in is unsupported", async () => {
+      mockEnvironmentsApi.capabilities.mockResolvedValue(getEnvironmentCapabilities([], {
+        sandboxProviders: { daytona: { supportsLoginPty: false } },
+      }));
+      const { root, queryClient } = await openStep4();
+      try {
+        await act(async () => queryClient.setQueryData(["ai-connections", "company-new"], {
+          currentUserId: "user-1", connections: [{ id: "saved", grantId: "grant", companyId: "company-new", provider: "anthropic", method: "subscription", ownership: "personal", ownerUserId: "user-1", status: "connected", isDefault: true }],
+        }));
+        await pickSource(/Claude/);
+        expect(document.body.textContent).not.toContain("This environment does not support browser sign-in.");
+        expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(1);
+        expect(mockAgentsApi.hire).toHaveBeenCalledTimes(1);
+      } finally { await act(async () => root.unmount()); }
+    });
 
     it("saves the submitted name before any provider choice or authentication", async () => {
       const { root } = await openStep4();

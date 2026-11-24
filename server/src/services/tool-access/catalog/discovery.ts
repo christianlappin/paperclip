@@ -1,4 +1,5 @@
 import { assertSupportedConnection } from "../connections/setup-policy.js";
+import { isAwsMcpConnection } from "../../connectors/aws/mcp-credentials.js";
 import { usesClientCredentials } from "../oauth/client-credentials.js";
 import { vercelCredentialFor, vercelConnectResourcesFor } from "../vercel-credentials.js";
 import { connectionSetupUrl, connectionReconnectUrl } from "../identifiers.js";
@@ -8,7 +9,7 @@ import { oauthConfig } from "../oauth/metadata.js";
 import { projectedConnectionHeaders } from "../connection-methods.js";
 import { nativeProviderCatalogFor } from "../../native-provider-catalogs.js";
 import { restConnectorFor } from "../../connectors/rest-registry.js";
-import { listGoogleWorkspaceRest, probeGoogleWorkspaceRest } from "../../google-workspace-rest-dispatch.js";
+import { googleWorkspaceCatalogToolTitle, listGoogleWorkspaceRest, probeGoogleWorkspaceRest } from "../../google-workspace-rest-dispatch.js";
 import { GOOGLE_WORKSPACE_SERVICES, GOOGLE_WORKSPACE_TOOL_TRANSPORT, googleWorkspaceServiceGranted, googleWorkspaceToolName, googleWorkspaceGrantedScopes, isGoogleWorkspaceToolGranted, type GoogleWorkspaceService } from "@paperclipai/shared";
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "../../connection-permission-errors.js";
 import { mcpDiscoveryHttpFailure, withMcpConnectionFailure } from "../../mcp-connection-failure.js";
@@ -171,7 +172,10 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
         const tools = GOOGLE_WORKSPACE_TOOL_TRANSPORT[service] === "paperclip_rest"
           ? await googleWorkspaceRestTools(connection, service, headers, scopes, actor)
           : await remoteTools(connection, headers, actor, profile.serverUrl, [], listOptions);
-        return tools.map((tool) => ({ ...tool, name: googleWorkspaceToolName(service, tool.name) }))
+        return tools.map((tool) => {
+          const name = googleWorkspaceToolName(service, tool.name);
+          return { ...tool, name, title: googleWorkspaceCatalogToolTitle("google-workspace", name, tool.title) };
+        })
           .filter((tool) => isGoogleWorkspaceToolGranted(tool.name, scopes));
       }));
       for (const [index, catalog] of catalogs.entries()) {
@@ -344,6 +348,14 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
     if (isInsufficientConnectionScope(response)) {
       await response.body?.cancel().catch(() => undefined);
       throw unprocessable(INSUFFICIENT_CONNECTION_SCOPE_MESSAGE, { code: "oauth_insufficient_scope", connectionId: connection.id });
+    }
+    if (response.status === 401 && isAwsMcpConnection(connection)) {
+      // A refused AWS token: mint a fresh one and list again (listing has no side effects).
+      headers = {
+        ...projectedConnectionHeaders(connection),
+        ...(await resolveCredentialHeaders(connection, actor, { forceRefresh: true })),
+      };
+      response = await relistAfterCredentialRefresh();
     }
     if (
       response.status === 401 &&
